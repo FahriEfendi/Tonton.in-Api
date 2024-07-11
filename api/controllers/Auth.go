@@ -4,33 +4,19 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
-	"math/rand"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
-	"Tonton.in-Api/api/models"
-
 	"github.com/dgrijalva/jwt-go"
+	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 	"golang.org/x/crypto/bcrypt"
-	"gopkg.in/gomail.v2"
 )
 
 type AuthController struct {
 	DB *sql.DB
-}
-
-type CustomClaims struct {
-	Email string `json:"email"`
-	jwt.StandardClaims
-}
-
-type Mahasiswa struct {
-	ID    int    `json:"id"`
-	Nomor int    `json:"nomor"`
-	NRP   string `json:"nrp"`
-	Email string `json:"email"`
 }
 
 type Respon struct {
@@ -50,15 +36,22 @@ type ResponError struct {
 	Message string `json:"message"`
 }
 
-type ForgotPassword struct {
-	ID           string `json:"id"`
-	NRP          string `json:"nrp"`
-	Email        string `json:"email"`
-	NewPassword  string `json:"newpassword"`
-	ConfPassword string `json:"confpassword"`
-	Expired      string `json:"expired"`
-	Expired_Date string `json:"expired_date"`
+type LoginResponse struct {
+	Status  string `json:"status"`
+	Message string `json:"message"`
+	Token   string `json:"token"`
 }
+
+type LoginAttempt struct {
+	Count       int
+	LastAttempt time.Time
+}
+
+var loginAttempts = make(map[string]*LoginAttempt)
+var loginAttemptsMutex = &sync.Mutex{}
+
+const maxAttempts = 3
+const lockoutDuration = 1 * time.Minute
 
 func NewAuthController(db *sql.DB) *AuthController {
 	return &AuthController{DB: db}
@@ -66,525 +59,345 @@ func NewAuthController(db *sql.DB) *AuthController {
 
 func (uc *AuthController) Login(c echo.Context) error {
 	var loginData struct {
-		Username string `json:"username"`
+		Username string `json:"nama"`
 		Password string `json:"password"`
 	}
 
 	if err := c.Bind(&loginData); err != nil {
 		log.Println(err)
+		return c.JSON(http.StatusBadRequest, "Permintaan Tidak Valid")
+	}
+
+	// Memeriksa percobaan login
+	loginAttemptsMutex.Lock()
+	attempt, exists := loginAttempts[loginData.Username]
+	if exists && attempt.Count >= maxAttempts && time.Since(attempt.LastAttempt) < lockoutDuration {
+		loginAttemptsMutex.Unlock()
+		return c.JSON(http.StatusTooManyRequests, "Terlalu banyak percobaan login. Silakan coba lagi nanti.")
+	}
+	loginAttemptsMutex.Unlock()
+
+	isAdminLogin := strings.Contains(loginData.Username, "@")
+	var user struct {
+		ID       string
+		Nama     string
+		Role     string
+		Password string
+	}
+
+	if isAdminLogin {
+		parts := strings.Split(loginData.Username, "@")
+		if len(parts) != 2 {
+			return c.JSON(http.StatusBadRequest, "Format username tidak valid")
+		}
+		adminName, actualUsername := parts[0], parts[1]
+
+		var admin struct {
+			Password string
+		}
+		err := uc.DB.QueryRow(`SELECT password FROM admin WHERE nama = ?`, adminName).Scan(&admin.Password)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				return c.JSON(http.StatusNotFound, "Admin tidak ditemukan")
+			}
+			log.Println(err)
+			return c.JSON(http.StatusInternalServerError, "Kesalahan Internal Server")
+		}
+
+		err = bcrypt.CompareHashAndPassword([]byte(admin.Password), []byte(loginData.Password))
+		if err != nil {
+			log.Println(err)
+			updateLoginAttempts(loginData.Username)
+			return c.JSON(http.StatusUnauthorized, "Password Admin Salah!")
+		}
+
+		err = uc.DB.QueryRow(`SELECT id, nama, role, password FROM users WHERE nama = ?`, actualUsername).Scan(&user.ID, &user.Nama, &user.Role, &user.Password)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				return c.JSON(http.StatusNotFound, "User tidak ditemukan")
+			}
+			log.Println(err)
+			return c.JSON(http.StatusInternalServerError, "Kesalahan Internal Server")
+		}
+	} else {
+		err := uc.DB.QueryRow(`SELECT id, nama, role, password FROM users WHERE nama = ?`, loginData.Username).Scan(&user.ID, &user.Nama, &user.Role, &user.Password)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				return c.JSON(http.StatusNotFound, "User tidak ditemukan")
+			}
+			log.Println(err)
+			return c.JSON(http.StatusInternalServerError, "Kesalahan Internal Server")
+		}
+
+		err = bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(loginData.Password))
+		if err != nil {
+			log.Println(err)
+			updateLoginAttempts(loginData.Username)
+			return c.JSON(http.StatusUnauthorized, "Password Anda Salah!")
+		}
+	}
+
+	// Mengatur ulang percobaan login pada login yang berhasil
+	resetLoginAttempts(loginData.Username)
+
+	claims := jwt.MapClaims{
+		"userId": user.ID,
+		"nama":   user.Nama,
+		"role":   user.Role,
+		"exp":    time.Now().Add(time.Minute * 2880).Unix(),
+		"iat":    time.Now().Unix(),
+	}
+
+	accessToken := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	accessTokenString, err := accessToken.SignedString([]byte("2131fwhdfh56e2s7j8"))
+	if err != nil {
+		log.Println(err)
+		return c.JSON(http.StatusInternalServerError, "Kesalahan Internal Server")
+	}
+
+	refreshToken := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	refreshTokenString, err := refreshToken.SignedString([]byte("2131fwhdfh56e2s7j8"))
+	if err != nil {
+		log.Println(err)
+		return c.JSON(http.StatusInternalServerError, "Kesalahan Internal Server")
+	}
+
+	_, err = uc.DB.Exec(`UPDATE users SET token = ? WHERE id = ?`, refreshTokenString, user.ID)
+	if err != nil {
+		log.Println(err)
+		return c.JSON(http.StatusInternalServerError, "Kesalahan Internal Server")
+	}
+
+	cookie := &http.Cookie{
+		Name:     "token",
+		Value:    refreshTokenString,
+		HttpOnly: true,
+		MaxAge:   24 * 60 * 60,
+	}
+	c.SetCookie(cookie)
+
+	response := LoginResponse{
+		Status:  "Berhasil",
+		Message: fmt.Sprintf("Selamat Datang %s", user.Nama),
+		Token:   accessTokenString,
+	}
+
+	return c.JSON(http.StatusOK, response)
+}
+
+func updateLoginAttempts(username string) {
+	loginAttemptsMutex.Lock()
+	defer loginAttemptsMutex.Unlock()
+
+	if attempt, exists := loginAttempts[username]; exists {
+		attempt.Count++
+		attempt.LastAttempt = time.Now()
+	} else {
+		loginAttempts[username] = &LoginAttempt{Count: 1, LastAttempt: time.Now()}
+	}
+}
+
+func resetLoginAttempts(username string) {
+	loginAttemptsMutex.Lock()
+	defer loginAttemptsMutex.Unlock()
+
+	// Hapus percobaan login tanpa memeriksa keberadaannya
+	delete(loginAttempts, username)
+}
+
+func (uc *AuthController) Register(c echo.Context) error {
+	var registerData struct {
+		Nama         string `json:"nama"`
+		Password     string `json:"password"`
+		ConfPassword string `json:"confPassword"`
+		Role         string `json:"role"`
+	}
+
+	if err := c.Bind(&registerData); err != nil {
+		log.Println(err)
 		return c.JSON(http.StatusBadRequest, "Bad Request")
 	}
 
-	var user models.Users
-	err := uc.DB.QueryRow(`SELECT role, password FROM users WHERE username = ?`, loginData.Username).Scan(&user.Role, &user.Password)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return c.JSON(http.StatusUnauthorized, "User tidak ditemukan")
-		}
-		log.Println(err)
-		return c.JSON(http.StatusInternalServerError, "Nim atau password salah")
-	}
-
-	err = bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(loginData.Password))
-	if err != nil {
-		log.Println(err)
-		return c.JSON(http.StatusUnauthorized, ResponError{
-			Status:  "Gagal",
-			Message: "Password Salah",
+	if registerData.Password != registerData.ConfPassword {
+		return c.JSON(http.StatusBadRequest, map[string]string{
+			"msg": "Password dan Confirm Password tidak cocok",
 		})
 	}
 
-	claims := jwt.MapClaims{
-		"username": loginData.Username,
-		"role":     user.Role,
-		"exp":      jwt.TimeFunc().Add(time.Minute * 2880).Unix(),
-		"iat":      jwt.TimeFunc().Unix(),
+	var existingName string
+	err := uc.DB.QueryRow(`SELECT nama FROM users WHERE nama = ?`, registerData.Nama).Scan(&existingName)
+	if err != nil && err != sql.ErrNoRows {
+		log.Println(err)
+		return c.JSON(http.StatusInternalServerError, "Internal Server Error")
 	}
 
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	accessToken, err := token.SignedString([]byte("access-secret")) // Replace with a stronger secret key
+	if existingName != "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{
+			"msg": "Nama telah terdaftar",
+		})
+	}
+
+	// Generate UUID baru
+	uuidNew, err := uuid.NewRandom()
+	if err != nil {
+		log.Println(err)
+		return c.JSON(http.StatusInternalServerError, Respons{
+			Status:  "Gagal",
+			Message: "Gagal menghasilkan UUID",
+		})
+	}
+
+	hashPassword, err := bcrypt.GenerateFromPassword([]byte(registerData.Password), bcrypt.DefaultCost)
 	if err != nil {
 		log.Println(err)
 		return c.JSON(http.StatusInternalServerError, "Internal Server Error")
 	}
 
-	// Update user token
-	user.Token = accessToken
-
-	response := ResponLogin{
-		Status:  "Berhasil",
-		Message: fmt.Sprintf("Selamat Datang %s", loginData.Username),
-		Token:   accessToken,
-	}
-
-	return c.JSON(http.StatusOK, response)
-}
-
-func (uc *AuthController) UsersEditPassword(c echo.Context) error {
-	// Mengecek apakah token valid dan mengambil data payload
-	claims, ok := c.Get("jwt").(jwt.MapClaims)
-	if !ok {
-		return c.JSON(http.StatusUnauthorized, "Token tidak valid")
-	}
-
-	// Mendapatkan ID pengguna dari token (asumsi userId tersimpan dalam token sebagai int)
-	no_mahasiswa, no_mahasiswaOk := claims["no_mahasiswa"].(string)
-	if !no_mahasiswaOk {
-		return c.JSON(http.StatusForbidden, "Data payload dalam token tidak lengkap")
-	}
-
-	// Mendapatkan password yang ingin diubah dari permintaan HTTP
-	var updateData struct {
-		OldPassword     string `json:"old_password"`
-		NewPassword     string `json:"new_password"`
-		ConfirmPassword string `json:"confirm_password"`
-	}
-
-	if err := c.Bind(&updateData); err != nil {
-		return c.JSON(http.StatusBadRequest, "Permintaan tidak valid")
-	}
-
-	// Validasi kata sandi baru dan konfirmasi kata sandi
-	if updateData.NewPassword != updateData.ConfirmPassword {
-		return c.JSON(http.StatusBadRequest, "Kata sandi baru dan konfirmasi kata sandi tidak cocok")
-	}
-
-	// Query SQL untuk mengambil password pengguna dari database berdasarkan No
-	query := "SELECT password FROM mahasiswa WHERE nomor = :1"
-	var storedPassword string
-	err := uc.DB.QueryRow(query, no_mahasiswa).Scan(&storedPassword)
+	_, err = uc.DB.Exec(`INSERT INTO users (nama, password, role,uuid) VALUES (?, ?, ?, ?)`, registerData.Nama, hashPassword, registerData.Role, uuidNew.String())
 	if err != nil {
-		if err == sql.ErrNoRows {
-			return c.JSON(http.StatusNotFound, "Pengguna tidak ditemukan")
-		}
-		return c.JSON(http.StatusInternalServerError, "Gagal mengambil data pengguna")
+		log.Println(err)
+		return c.JSON(http.StatusInternalServerError, "Internal Server Error")
 	}
 
-	// Verifikasi password lama menggunakan bcrypt
-	if err := bcrypt.CompareHashAndPassword([]byte(storedPassword), []byte(updateData.OldPassword)); err != nil {
-		return c.JSON(http.StatusBadRequest, Respons{
-			Status:  "Gagal",
-			Message: "Password lama salah",
-		})
-	}
-
-	// Hash password baru
-	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(updateData.NewPassword), bcrypt.DefaultCost)
-	if err != nil {
-		return c.JSON(http.StatusInternalServerError, "Gagal menghash password baru")
-	}
-
-	// Query SQL untuk mengupdate password baru
-	updateQuery := "UPDATE mahasiswa SET password = :1 WHERE nomor = :2"
-	_, err = uc.DB.Exec(updateQuery, string(hashedPassword), no_mahasiswa)
-	if err != nil {
-		return c.JSON(http.StatusInternalServerError, "Gagal mengupdate password")
-	}
-
-	// Delete user token
-	_, err = uc.DB.Exec("DELETE FROM USER_TOKENS WHERE user_id = :1", no_mahasiswa)
-	if err != nil {
-		response := ResponError{
-			Status:  "Berhasil",
-			Message: "Telah menghapus data tokens",
-		}
-		return c.JSON(http.StatusOK, response)
-	}
-
-	return c.JSON(http.StatusOK, "Password berhasil diubah")
-}
-
-func (uc *AuthController) VerifyToken(next echo.HandlerFunc) echo.HandlerFunc {
-	return func(c echo.Context) error {
-		authHeader := c.Request().Header.Get("Authorization")
-		tokenStr := ""
-		if authHeader != "" {
-			tokenArr := strings.Split(authHeader, " ")
-			if len(tokenArr) == 2 && tokenArr[0] == "Bearer" {
-				tokenStr = tokenArr[1]
-			}
-		}
-
-		if tokenStr == "" {
-			return c.JSON(http.StatusBadRequest, Respons{
-				Status:  "Gagal",
-				Message: "Mohon Login ke akun anda",
-			})
-		}
-
-		token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
-			// PENTING: Ganti dengan secret key yang benar
-			return []byte("access-secret"), nil
-		})
-		if err != nil || !token.Valid {
-			return c.JSON(http.StatusBadRequest, Respons{
-				Status:  "Gagal",
-				Message: "Mohon Login ke akun anda",
-			})
-		}
-
-		claims, ok := token.Claims.(jwt.MapClaims)
-		if !ok {
-			return c.JSON(http.StatusForbidden, "Data payload dalam token tidak valid")
-		}
-
-		// Simpan data payload dalam konteks
-		c.Set("jwt", claims)
-
-		return next(c)
-	}
-}
-
-func censor(word string) string {
-	censored := make([]string, len(word))
-	length := len(word)
-	target := (length + 1) / 2
-
-	rangeStart := 3
-	rangeEnd := target
-
-	for i := 0; i < length; i++ {
-		c := string(word[i])
-		if i >= rangeStart && i <= rangeEnd {
-			if c == " " {
-				censored[i] = "&nbsp;&nbsp;"
-			} else {
-				censored[i] = "*"
-			}
-		} else {
-			censored[i] = c
-		}
-	}
-
-	return strings.Join(censored, "")
-}
-
-func (uc *AuthController) Scannrp(c echo.Context) error {
-	request := new(struct {
-		NRP string `json:"nrp"`
+	return c.JSON(http.StatusOK, map[string]string{
+		"msg": "User berhasil didaftarkan",
 	})
-
-	if err := c.Bind(request); err != nil {
-		return err
-	}
-
-	// Query ke database untuk mencari NRP
-	var mahasiswa Mahasiswa
-	err := uc.DB.QueryRow("SELECT email FROM MAHASISWA WHERE nrp = :1", request.NRP).Scan(&mahasiswa.Email)
-	if err != nil {
-		response := ResponError{
-			Status:  "Gagal",
-			Message: "NRP tidak ditemukan",
-		}
-		return c.JSON(http.StatusNotFound, response)
-	}
-
-	// Sensor email dengan menggunakan fungsi censor
-	mahasiswa.Email = censor(mahasiswa.Email)
-
-	// Mengembalikan email dengan lima huruf pertama disensor
-	response := Respon{
-		Status:  "Sukses",
-		Message: "Berhasil Menemukan NRP",
-		Data: map[string]interface{}{
-			"email": mahasiswa.Email,
-		},
-	}
-	return c.JSON(http.StatusOK, response)
-}
-
-func (uc *AuthController) ScanEmail(c echo.Context) error {
-	request := new(struct {
-		Nrp   string `json:"nrp"`
-		Email string `json:"email"`
-	})
-
-	if err := c.Bind(request); err != nil {
-		return err
-	}
-
-	// Cek apakah email ada di database Mahasiswa
-	var mahasiswa Mahasiswa
-	err := uc.DB.QueryRow("	SELECT EMAIL, nrp FROM mahasiswa WHERE NRP = :1 and email=:2", request.Nrp, request.Email).Scan(&mahasiswa.Email, &mahasiswa.NRP)
-	if err != nil {
-		response := Respon{
-			Status:  "Gagal",
-			Message: "Email tidak ditemukan",
-			Data:    map[string]interface{}{},
-		}
-		return c.JSON(http.StatusNotFound, response)
-	}
-
-	// Generate random string untuk forgot password
-	randomString := generateRandomString(10) // Ganti 10 dengan panjang string yang diinginkan
-
-	// Mendapatkan waktu saat ini
-	currentTime := time.Now()
-
-	// Menambahkan 3 hari ke waktu saat ini
-	expiredDate := currentTime.Add(3 * 24 * time.Hour)
-
-	// Format tanggal kedaluwarsa menjadi string yang sesuai dengan format yang Anda gunakan dalam basis data
-
-	// Tambahkan data ke tabel forgot_password
-	_, err = uc.DB.Exec("INSERT INTO forgot_password (id, nrp, email, expired_date) VALUES (:1, :2, :3, :4)", randomString, mahasiswa.NRP, request.Email, expiredDate)
-
-	if err != nil {
-		print(err.Error())
-		return err
-	}
-
-	// Kirim link forgot password ke email
-	sendForgotPasswordEmail(request.Email, randomString)
-
-	// Mengembalikan respons berhasil
-	response := Respon{
-		Status:  "Sukses",
-		Message: "Link forgot password telah dikirim ke email Anda.",
-	}
-	return c.JSON(http.StatusOK, response)
-}
-
-// Fungsi untuk menghasilkan random string
-func generateRandomString(length int) string {
-	rand.Seed(time.Now().UnixNano())
-	charset := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	result := make([]byte, length)
-	for i := 0; i < length; i++ {
-		result[i] = charset[rand.Intn(len(charset))]
-	}
-	return string(result)
-}
-
-func sendForgotPasswordEmail(email, randomString string) {
-	// Inisialisasi pesan email
-	m := gomail.NewMessage()
-	m.SetHeader("From", "fahri.3312001092@students.polibatam.ac.id") // alamat email pengirim
-	m.SetHeader("To", email)                                         // Alamat email penerima
-	m.SetHeader("Subject", "Forgot Password")                        // Subjek email
-	// Isi email dengan link forgot password
-	m.SetBody("text/html", fmt.Sprintf("Klik link berikut untuk mereset password Anda: <a href='http://localhost:3000/auth/resetpass/%s'>Reset Password</a>", randomString))
-
-	// Konfigurasi pengiriman email
-	d := gomail.NewDialer("smtp.office365.com", 587, "fahri.3312001092@students.polibatam.ac.id", "Padang0795")
-
-	// Kirim email
-	if err := d.DialAndSend(m); err != nil {
-		// Handle error jika pengiriman gagal dan log error
-		log.Printf("Gagal mengirim email ke %s: %s", email, err.Error())
-		// Anda juga dapat menambahkan penanganan error lain sesuai kebutuhan
-	}
-}
-
-func (uc *AuthController) Ceklinkforgot(c echo.Context) error {
-	request := new(struct {
-		ID string `json:"id"`
-	})
-
-	if err := c.Bind(request); err != nil {
-		return err
-	}
-
-	// Query ke database untuk mencari data forgot_password berdasarkan ID
-	var forgotPassword ForgotPassword
-	err := uc.DB.QueryRow("SELECT nrp, email, expired,expired_date FROM FORGOT_PASSWORD WHERE id = :id", request.ID).Scan(&forgotPassword.NRP, &forgotPassword.Email, &forgotPassword.Expired, &forgotPassword.Expired_Date)
-	if err != nil {
-		response := ResponError{
-			Status:  "Gagal",
-			Message: "ID tidak ditemukan",
-		}
-		return c.JSON(http.StatusNotFound, response)
-	}
-
-	// Validasi apakah random string sesuai
-	if forgotPassword.ID != forgotPassword.ID {
-		response := ResponError{
-			Status:  "Gagal",
-			Message: "Randomstring tidak ditemukan",
-		}
-		return c.JSON(http.StatusInternalServerError, response)
-	}
-
-	// Validasi apakah expired = 1
-	if forgotPassword.Expired == "1" {
-		response := ResponError{
-			Status:  "Gagal",
-			Message: "Link reset password telah digunakan",
-		}
-		return c.JSON(http.StatusBadRequest, response)
-	}
-
-	// Konversi expired_date  ke time.Time
-	expiredDate, err := time.Parse(time.RFC3339, forgotPassword.Expired_Date)
-	if err != nil {
-		response := ResponError{
-			Status:  "Gagal",
-			Message: "Eror konversi tanggal",
-		}
-		return c.JSON(http.StatusInternalServerError, response)
-	}
-
-	// Validasi apakah expired_date lebih kecil dari tanggal saat ini
-	currentTime := time.Now()
-	if expiredDate.Before(currentTime) {
-		response := ResponError{
-			Status:  "Gagal",
-			Message: "Link reset password telah kadaluarsa.",
-		}
-		return c.JSON(http.StatusBadRequest, response)
-	}
-
-	// Mengembalikan pesan sukses
-	response := ResponError{
-		Status:  "Berhasil",
-		Message: "Link masih berlaku.",
-	}
-	return c.JSON(http.StatusOK, response)
-}
-
-func (uc *AuthController) ForgotPassword(c echo.Context) error {
-	// Mendapatkan nilai dari parameter URL
-	randomString := c.Param("randomstring")
-
-	request := new(struct {
-		NewPassword  string `json:"newpassword"`
-		ConfPassword string `json:"confpassword"`
-	})
-
-	if err := c.Bind(request); err != nil {
-		return err
-	}
-
-	// Query ke database untuk mencari data forgot_password berdasarkan ID
-	var forgotPassword ForgotPassword
-	err := uc.DB.QueryRow("SELECT nrp, email, expired,expired_date FROM FORGOT_PASSWORD WHERE id = :id", randomString).Scan(&forgotPassword.NRP, &forgotPassword.Email, &forgotPassword.Expired, &forgotPassword.Expired_Date)
-	if err != nil {
-		response := ResponError{
-			Status:  "Gagal",
-			Message: "ID tidak ditemukan",
-		}
-		return c.JSON(http.StatusNotFound, response)
-	}
-
-	// Validasi apakah random string sesuai
-	if forgotPassword.ID != forgotPassword.ID {
-		response := ResponError{
-			Status:  "Gagal",
-			Message: "Randomstring tidak ditemukan",
-		}
-		return c.JSON(http.StatusNotFound, response)
-	}
-
-	// Validasi apakah expired = 1
-	if forgotPassword.Expired == "1" {
-		response := ResponError{
-			Status:  "Gagal",
-			Message: "Link reset password telah kadaluarsa.",
-		}
-		return c.JSON(http.StatusBadRequest, response)
-	}
-
-	// Konversi expired_date  ke time.Time
-	expiredDate, err := time.Parse(time.RFC3339, forgotPassword.Expired_Date)
-	if err != nil {
-		response := ResponError{
-			Status:  "Gagal",
-			Message: "Eror konversi tanggal",
-		}
-		return c.JSON(http.StatusInternalServerError, response)
-	}
-
-	// Validasi apakah expired_date lebih kecil dari tanggal saat ini
-	currentTime := time.Now()
-	if expiredDate.Before(currentTime) {
-		response := ResponError{
-			Status:  "Gagal",
-			Message: "Link reset password telah kadaluarsa.",
-		}
-		return c.JSON(http.StatusBadRequest, response)
-	}
-
-	// Validasi apakah newpassword dan confpassword cocok
-	if request.NewPassword != request.ConfPassword {
-		response := ResponError{
-			Status:  "Gagal",
-			Message: "Password baru dan konfirmasi password tidak cocok.",
-		}
-		return c.JSON(http.StatusBadRequest, response)
-	}
-
-	// Hash the password before storing it
-	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(request.NewPassword), bcrypt.DefaultCost)
-	if err != nil {
-		response := ResponError{
-			Status:  "Gagal",
-			Message: "Kesalahan Hash Password.",
-		}
-		return c.JSON(http.StatusInternalServerError, response)
-	}
-	request.NewPassword = string(hashedPassword) // Simpan password yang di-hash kembali ke dalam user struct
-
-	// Implementasi update password (sesuai dengan kebutuhan Anda)
-	// Misalnya, Anda dapat menggunakan SQL untuk memperbarui password pengguna dengan NRP yang sesuai:
-	_, err = uc.DB.Exec("UPDATE mahasiswa SET password = :1 WHERE nrp = :2", request.NewPassword, forgotPassword.NRP)
-	if err != nil {
-		return err
-	}
-
-	// Tandai link reset password sebagai sudah kadaluarsa dengan mengubah expired menjadi 1
-	_, err = uc.DB.Exec("UPDATE FORGOT_PASSWORD SET expired = 1, newpassword = :1, confpassword = :2 WHERE id = :id", request.NewPassword, request.NewPassword, randomString)
-	if err != nil {
-		return err
-	}
-
-	// Mengembalikan pesan sukses
-	response := ResponError{
-		Status:  "Sukses",
-		Message: "Password Berhasil Di Reset.",
-	}
-	return c.JSON(http.StatusOK, response)
 }
 
 func (uc *AuthController) Logout(c echo.Context) error {
-	claims, ok := c.Get("jwt").(jwt.MapClaims)
+	// Get the token from cookies
+	token, err := c.Cookie("token")
+	if err != nil {
+		// If there's no token, return 204 No Content
+		return c.NoContent(http.StatusNoContent)
+	}
+
+	// Find the user by token
+	var user struct {
+		ID int
+	}
+	err = uc.DB.QueryRow(`SELECT id FROM users WHERE token = ?`, token.Value).Scan(&user.ID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			// If no user found with the token, return 204 No Content
+			return c.NoContent(http.StatusNoContent)
+		}
+		log.Println(err)
+		return c.JSON(http.StatusInternalServerError, "Internal Server Error")
+	}
+
+	// Update the user's token to null
+	_, err = uc.DB.Exec(`UPDATE users SET token = NULL WHERE id = ?`, user.ID)
+	if err != nil {
+		log.Println(err)
+		return c.JSON(http.StatusInternalServerError, "Internal Server Error")
+	}
+
+	// Clear the token cookie
+	c.SetCookie(&http.Cookie{
+		Name:   "token",
+		Value:  "",
+		Path:   "/",
+		MaxAge: -1,
+	})
+
+	return c.NoContent(http.StatusOK)
+}
+
+func (uc *AuthController) Token(c echo.Context) error {
+	// Get the token from cookies
+	tokenCookie, err := c.Cookie("token")
+	if err != nil {
+		// If there's no token, return 401 Unauthorized
+		return c.NoContent(http.StatusUnauthorized)
+	}
+
+	tokenString := tokenCookie.Value
+
+	/* // Print the token string
+	log.Println("Token String:", tokenString) */
+
+	// Verify the token
+	claims := &jwt.MapClaims{}
+	token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
+		// Replace the string key with your actual secret key
+		return []byte("2131fwhdfh56e2s7j8"), nil
+	})
+
+	if err != nil {
+		if err == jwt.ErrSignatureInvalid {
+			log.Println("Invalid token signature:", err)
+			return c.JSON(http.StatusUnauthorized, map[string]string{
+				"message": "Mohon login ulang",
+			})
+		}
+		log.Println("Error parsing token:", err)
+		return c.JSON(http.StatusInternalServerError, "Internal Server Error")
+	}
+
+	if !token.Valid {
+		return c.JSON(http.StatusUnauthorized, map[string]string{
+			"message": "Mohon login ulang",
+		})
+	}
+
+	// Extract claims
+	nama, ok := (*claims)["nama"].(string)
 	if !ok {
-		return c.JSON(http.StatusUnauthorized, "Token tidak valid")
+		log.Println("Invalid token claims: missing 'nama'")
+		return c.JSON(http.StatusUnauthorized, map[string]string{
+			"message": "Mohon login ulang",
+		})
+	}
+	userId, ok := (*claims)["userId"].(string)
+	if !ok {
+		log.Println("Invalid token claims: missing 'userId'")
+		return c.JSON(http.StatusUnauthorized, map[string]string{
+			"message": "Mohon login ulang",
+		})
+	}
+	role, ok := (*claims)["role"].(string)
+	if !ok {
+		log.Println("Invalid token claims: missing 'role'")
+		return c.JSON(http.StatusUnauthorized, map[string]string{
+			"message": "Mohon login ulang",
+		})
 	}
 
-	no_mahasiswa := claims["no_mahasiswa"].(string)
-
-	// Query database untuk memeriksa apakah beasiswa dengan nomor tersebut ada
-	var count int
-	err := uc.DB.QueryRow("SELECT COUNT(*) FROM USER_TOKENS WHERE user_id = :1", no_mahasiswa).Scan(&count)
+	// Find the user by UUID in the database to ensure it exists
+	var user struct {
+		UUID string
+	}
+	err = uc.DB.QueryRow(`SELECT uuid FROM users WHERE token = ?`, tokenString).Scan(&user.UUID)
 	if err != nil {
-		response := ResponError{
-			Status:  "Gagal",
-			Message: "Gagal memeriksa data usertoken",
+		if err == sql.ErrNoRows {
+			// If no user found with the token, return 403 Forbidden
+			return c.NoContent(http.StatusForbidden)
 		}
-		return c.JSON(http.StatusInternalServerError, response)
+		log.Println(err)
+		return c.JSON(http.StatusInternalServerError, "Internal Server Error")
 	}
 
-	// Jika ID tidak ditemukan, kirim pesan error
-	if count == 0 {
-		response := ResponError{
-			Status:  "Gagal",
-			Message: "Silahkan Login Kembali",
-		}
-		return c.JSON(http.StatusUnauthorized, response)
+	// Generate a new access token
+	accessTokenClaims := jwt.MapClaims{
+		"nama":   nama,
+		"userId": userId,
+		"role":   role,
+		"exp":    time.Now().Add(15 * time.Second).Unix(),
 	}
-
-	_, err = uc.DB.Exec("DELETE FROM USER_TOKENS WHERE user_id = :1", no_mahasiswa)
+	// Sign the access token
+	accessToken := jwt.NewWithClaims(jwt.SigningMethodHS256, accessTokenClaims)
+	accessTokenString, err := accessToken.SignedString([]byte("2131fwhdfh56e2s7j8"))
 	if err != nil {
-		response := ResponError{
-			Status:  "Gagal",
-			Message: "Kesalahan Logout",
-		}
-		return c.JSON(http.StatusInternalServerError, response)
+		log.Println("Error signing new access token:", err)
+		return c.JSON(http.StatusInternalServerError, "Internal Server Error")
 	}
 
-	response := ResponError{
-		Status:  "Berhasil",
-		Message: "Anda Telah Logout",
-	}
-	return c.JSON(http.StatusOK, response)
+	// Send the new access token as a response
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"nama":   nama,
+		"token":  accessTokenString,
+		"userId": userId,
+		"role":   role,
+	})
 }

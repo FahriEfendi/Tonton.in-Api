@@ -25,5 +25,8 @@ func SetupRoutes(e *echo.Echo, db *sql.DB) {
 	e.PUT("/videos/incdislike/:id", Users.IncDislikevideos)
 	e.PUT("/videos/decdislike/:id", Users.DecDislikevideos)
 	e.POST("/login", Auth.Login)
+	e.POST("/register", Auth.Register)
+	e.DELETE("/logout", Auth.Logout)
+	e.GET("/token", Auth.Token)
 
 }

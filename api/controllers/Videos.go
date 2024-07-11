@@ -30,7 +30,7 @@ func NewUserController(db *sql.DB) *UserController {
 }
 
 func (uc *UserController) GetAllVideos(c echo.Context) error {
-	rows, err := uc.DB.Query(`SELECT v.id, v.title, v.slug, v.description, v.views, v.vid_like, v.dislike,id_tag,id_category,vid_thumbnail,e.name as episode
+	rows, err := uc.DB.Query(`SELECT v.id, v.uuid, v.title, v.slug, v.description, v.views, v.vid_like, v.dislike,id_tag,id_category,vid_thumbnail,e.name as episode, v.createdAt, v.time
 	FROM videos v
 	INNER JOIN episode e on v.id_episode = e.id`)
 	if err != nil {
@@ -42,7 +42,7 @@ func (uc *UserController) GetAllVideos(c echo.Context) error {
 	var Videos []models.GetAllVideos
 	for rows.Next() {
 		var video models.GetAllVideos
-		err := rows.Scan(&video.Id, &video.Title, &video.Slug, &video.Description, &video.Views, &video.Like, &video.Dislike, &video.Id_tag, &video.Id_category, &video.Vid_thumbnail, &video.Episode)
+		err := rows.Scan(&video.Id, &video.Uuid, &video.Title, &video.Slug, &video.Description, &video.Views, &video.Like, &video.Dislike, &video.Id_tag, &video.Id_category, &video.Vid_thumbnail, &video.Episode, &video.CreatedAt, &video.Time)
 		if err != nil {
 			log.Println(err)
 			return c.JSON(http.StatusInternalServerError, "Gagal Mengambil data videos")
@@ -112,7 +112,7 @@ func (uc *UserController) GetAllVideosBokepLiveRecord(c echo.Context) error {
 func (uc *UserController) GetVideosByID(c echo.Context) error {
 	uuid := c.Param("id")
 
-	rows, err := uc.DB.Query(`SELECT v.id, v.title, v.slug, v.description, v.views, v.vid_like, v.dislike, t.name as tag, c.name as category
+	rows, err := uc.DB.Query(`SELECT v.id, v.title, v.slug, v.description, v.views, v.vid_like, v.dislike, t.name as tag, c.name as category,local_like,local_dislike
 	FROM videos v
 	INNER JOIN tag t ON v.id_tag = t.id
     INNER JOIN category c ON v.id_category = c.id  
@@ -125,7 +125,7 @@ func (uc *UserController) GetVideosByID(c echo.Context) error {
 
 	var video models.GetAllVideos
 	if rows.Next() {
-		err := rows.Scan(&video.Id, &video.Title, &video.Slug, &video.Description, &video.Views, &video.Like, &video.Dislike, &video.Id_tag, &video.Id_category)
+		err := rows.Scan(&video.Id, &video.Title, &video.Slug, &video.Description, &video.Views, &video.Like, &video.Dislike, &video.Id_tag, &video.Id_category, &video.Local_like, &video.Local_dislike)
 		if err != nil {
 			log.Println(err)
 			return c.JSON(http.StatusInternalServerError, "Gagal mengambil data video")
@@ -147,15 +147,20 @@ func (uc *UserController) GetVideosByID(c echo.Context) error {
 func (uc *UserController) CreateVideos(c echo.Context) error {
 	var err error
 	var videos struct {
-		Title       string `json:"title"`
-		Slug        string `json:"slug"`
-		Description string `json:"description"`
-		Views       string `json:"views"`
-		Like        string `json:"vid_like"`
-		Dislike     string `json:"dislike"`
-		Id_tag      string `json:"id_tag"`
-		Id_category string `json:"id_category"`
-		Episode     string `json:"episode"`
+		Title         string `json:"title"`
+		Slug          string `json:"slug"`
+		Description   string `json:"description"`
+		Views         string `json:"views"`
+		Like          string `json:"vid_like"`
+		Dislike       string `json:"dislike"`
+		Id_tag        string `json:"id_tag"`
+		Id_category   string `json:"id_category"`
+		Id_episode    string `json:"id_episode"`
+		Episode       string `json:"episode"`
+		Local_like    string `json:"local-like"`
+		Local_dislike string `json:"local-dislike"`
+		Vid_thumbnail string `json:"vid_thumbnail"`
+		Time          string `json:"time"`
 	}
 
 	if err := c.Bind(&videos); err != nil {
@@ -173,6 +178,9 @@ func (uc *UserController) CreateVideos(c echo.Context) error {
 		})
 	}
 
+	videos.Local_like = videos.Slug + "-l"
+	videos.Local_dislike = videos.Slug + "-dl"
+
 	// Generate UUID baru
 	uuidNew, err := uuid.NewRandom()
 	if err != nil {
@@ -181,8 +189,8 @@ func (uc *UserController) CreateVideos(c echo.Context) error {
 	}
 
 	_, err = uc.DB.Exec(
-		"INSERT INTO videos (title, slug, description, views, vid_like, dislike, id_tag, id_category,uuid,episode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		videos.Title, videos.Slug, videos.Description, videos.Views, videos.Like, videos.Dislike, videos.Id_tag, videos.Id_category, uuidNew.String(), videos.Episode,
+		"INSERT INTO videos (title, slug, description, views, vid_like, dislike, id_tag, id_category, uuid, episode, local_like, local_dislike,id_episode,vid_thumbnail,time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		videos.Title, videos.Slug, videos.Description, videos.Views, videos.Like, videos.Dislike, videos.Id_tag, videos.Id_category, uuidNew.String(), videos.Episode, videos.Local_like, videos.Local_dislike, videos.Id_episode, videos.Vid_thumbnail, videos.Time,
 	)
 	if err != nil {
 		log.Println(err)
